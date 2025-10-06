@@ -1,43 +1,4 @@
-function generateSchedule() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var availabilitySheet = ss.getSheetByName('availability');
-  var scheduleSheet = ss.getSheetByName('final schedule');
-  var logSheet = ss.getSheetByName('log');
-  var ledgerSheet = ss.getSheetByName('ledger');
-  
-  // === Setup ===
-  var days = ["Tuesday", "Thursday", "Friday"];
-  var timestamp = Utilities.formatDate(new Date(), "America/Denver", "yyyy-MM-dd HH:mm");
-  
-
-
-  // === Clear schedule (but keep headers) ===
-  scheduleSheet.getRange("A3:C").clearContent();
-  
-  // === Load data ===
-  var { availability, people, partners } = parseAvailability(availabilitySheet);
-  var ledger = loadLedger(ledgerSheet);
-  var schedule = [];
-
-  // === Assign volunteers for each day ===
-  days.forEach(function(day) {
-    var chosen = assignVolunteersToDay(day, availability, partners, ledger);
-    if (chosen.length > 0) {
-      schedule.push([day, chosen[0], chosen[1]]);
-
-    } else {
-      schedule.push([day, "Not enough volunteers", ""]);
-    }
-  });
-  
-  // === Save new schedule ===
-  scheduleSheet.getRange("A1").setValue("Last Updated");
-  scheduleSheet.getRange("B1").setValue(timestamp);
-  scheduleSheet.getRange(3, 1, schedule.length, 3).setValues(schedule);
-
-  // === Log update ===
-  logSheet.appendRow([timestamp, "Schedule Updated", JSON.stringify(schedule)]);
-}
+// generateSchedule was deprecated in favor of main* entry points
 
 /**
  * Parse availability into structures we can use
@@ -64,35 +25,7 @@ function parseAvailability(sheet) {
   return { availability, people, partners };
 }
 
-/**
- * Assign two volunteers to a given day
- * Weighted by lowest ledger counts (fairness)
- */
-function assignVolunteersToDay(day, availability, partners, ledger) {
-  var candidates = availability[day] || [];
-  if (candidates.length < 2) return [];
-  
-  // Sort candidates by how many times they’ve served (ascending)
-  candidates.sort(function(a, b) {
-    return (ledger[a] || 0) - (ledger[b] || 0);
-  });
-  
-  // Try to honor partner preferences
-  for (var i = 0; i < candidates.length; i++) {
-    var p = candidates[i];
-    if (partners[p]) {
-      for (var j = 0; j < partners[p].length; j++) {
-        var partner = partners[p][j];
-        if (candidates.includes(partner)) {
-          return [p, partner];
-        }
-      }
-    }
-  }
 
-  // Otherwise, pick the two lowest-count people
-  return [candidates[0], candidates[1]];
-}
 
 /**
  * === Ledger Helpers ===
@@ -109,22 +42,10 @@ function loadLedger(sheet) {
 }
 
 /**
- * Fisher-Yates shuffle (unused in fairness mode but kept for flexibility)
- */
-function shuffle(array) {
-  for (var i = array.length - 1; i > 0; i--) {
-    var j = Math.floor(Math.random() * (i + 1));
-    var temp = array[i];
-    array[i] = array[j];
-    array[j] = temp;
-  }
-}
-
-/**
  * Extend the schedule by adding Tuesdays, Thursdays, and Fridays for one month forward
  * This function reads the existing schedule and continues from the last entry
  */
-function extendScheduleOneMonth() {
+function mainExtendScheduleOneMonth() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var scheduleSheet = ss.getSheetByName('final schedule');
   
@@ -267,4 +188,125 @@ function generateNextMonthDates(lastDate) {
   }
   
   return entries;
+}
+
+/**
+ * Fill any rows in the final schedule that have dates but are missing
+ * one or both names in columns D and E. Uses availability and a working
+ * copy of the ledger for fairness (do not write to the ledger sheet).
+ * Partner preference is a soft constraint and is only applied when it
+ * does not violate the fairness guard (avoid differences > 1 from min).
+ */
+function mainFillMissingAssignments() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var availabilitySheet = ss.getSheetByName('availability');
+  var scheduleSheet = ss.getSheetByName('final schedule');
+  var ledgerSheet = ss.getSheetByName('ledger');
+  var logSheet = ss.getSheetByName('log');
+
+  if (!availabilitySheet || !scheduleSheet || !ledgerSheet) {
+    Logger.log('Required sheets not found');
+    return;
+  }
+
+  var parsed = parseAvailability(availabilitySheet);
+  var availability = parsed.availability;
+  var partners = parsed.partners;
+  var baseLedger = loadLedger(ledgerSheet);
+
+  // Working copy used only for selection fairness within this run
+  var workingLedger = {};
+  Object.keys(baseLedger).forEach(function(name) { workingLedger[name] = baseLedger[name]; });
+
+  var data = scheduleSheet.getDataRange().getValues();
+  var updates = [];
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var dateValue = row[1];
+    var dayName = (row[2] || '').toString().trim();
+    if (!dateValue || !dayName) continue;
+
+    var who1 = (row[3] || '').toString().trim();
+    var who2 = (row[4] || '').toString().trim();
+    if (who1 && who2) continue;
+
+    var existing = who1 || who2 || '';
+    var candidates = getEligibleCandidatesForRow(dayName, availability, [who1, who2], workingLedger);
+    if (candidates.length === 0) continue;
+
+    if (!who1 && !who2) {
+      var pair = selectPairFromCandidates(candidates, partners, workingLedger);
+      if (pair[0]) scheduleSheet.getRange(i + 1, 4).setValue(pair[0]);
+      if (pair[1]) scheduleSheet.getRange(i + 1, 5).setValue(pair[1]);
+      updates.push({ row: i + 1, who: pair.slice(0, 2) });
+    } else {
+      // Only one blank; fill only that cell
+      var second = selectSecondWithPreference(existing, candidates, partners, workingLedger);
+      if (!second) continue;
+      if (!who1) scheduleSheet.getRange(i + 1, 4).setValue(second);
+      if (!who2) scheduleSheet.getRange(i + 1, 5).setValue(second);
+      updates.push({ row: i + 1, who: [existing, second].filter(function(x){return x;}) });
+    }
+  }
+
+  // Sheet-level timestamp only
+  var timestamp = Utilities.formatDate(new Date(), 'America/Denver', 'yyyy-MM-dd HH:mm');
+  scheduleSheet.getRange('F1').setValue(timestamp);
+  if (logSheet) {
+    logSheet.appendRow([timestamp, 'Filled Missing Assignments', JSON.stringify(updates)]);
+  }
+}
+
+// === Helpers used by fillMissingAssignments ===
+function getEligibleCandidatesForRow(dayName, availability, excludeNames, workingLedger) {
+  var excluded = {};
+  (excludeNames || []).forEach(function(n){ if (n) excluded[n] = true; });
+  var candidates = (availability[dayName] || []).filter(function(name){ return !excluded[name]; });
+  candidates.sort(function(a, b) { return (workingLedger[a] || 0) - (workingLedger[b] || 0); });
+  return candidates;
+}
+
+function selectPairFromCandidates(candidates, partners, workingLedger) {
+  if (candidates.length === 0) return [];
+  var first = candidates[0];
+  incrementWorking(workingLedger, first);
+
+  var remaining = candidates.slice(1);
+  remaining.sort(function(a, b) { return (workingLedger[a] || 0) - (workingLedger[b] || 0); });
+  var second = chooseSecondFromList(first, remaining, partners, workingLedger);
+  if (second) incrementWorking(workingLedger, second);
+  return [first, second].filter(function(x){return x;});
+}
+
+function selectSecondWithPreference(existingName, candidates, partners, workingLedger) {
+  var second = chooseSecondFromList(existingName, candidates, partners, workingLedger);
+  if (second) incrementWorking(workingLedger, second);
+  return second;
+}
+
+function chooseSecondFromList(anchor, candidates, partners, workingLedger) {
+  if (candidates.length === 0) return null;
+  var minCount = (workingLedger[candidates[0]] || 0);
+  var maxAllowed = minCount + 1;
+  var eligible = candidates.filter(function(n){ return (workingLedger[n] || 0) <= maxAllowed; });
+
+  if (eligible.length > 0 && partners[anchor]) {
+    var preferred = eligible.filter(function(n){ return partners[anchor].indexOf(n) !== -1; });
+    if (preferred.length > 0) {
+      preferred.sort(function(a, b){ return (workingLedger[a] || 0) - (workingLedger[b] || 0); });
+      return preferred[0];
+    }
+  }
+  return candidates[0];
+}
+
+function incrementWorking(workingLedger, name) {
+  workingLedger[name] = (workingLedger[name] || 0) + 1;
+}
+
+// Single entry point for triggers or manual runs
+function mainSchedule() {
+  mainExtendScheduleOneMonth();
+  mainFillMissingAssignments();
 }
