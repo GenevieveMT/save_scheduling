@@ -1,45 +1,80 @@
 // generateSchedule was deprecated in favor of main* entry points
 
+// Single entry point for triggers or manual runs
+function mainSchedule() {
+  mainExtendScheduleOneMonth();
+  mainFillMissingAssignments();
+}
+
+
 /**
- * Parse availability into structures we can use
+ * Fill any rows in the final schedule that have dates but are missing
+ * one or both names in columns D and E. Uses availability and a working
+ * copy of the ledger for fairness (do not write to the ledger sheet).
+ * Partner preference is a soft constraint and is only applied when it
+ * does not violate the fairness guard (avoid differences > 1 from min).
  */
-function parseAvailability(sheet) {
-  var data = sheet.getDataRange().getValues();
-  var availability = { "Tuesday": [], "Thursday": [], "Friday": [] };
-  var people = [];
-  var partners = {};
-  
+function mainFillMissingAssignments() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var availabilitySheet = ss.getSheetByName('availability');
+  var scheduleSheet = ss.getSheetByName('final schedule');
+  var ledgerSheet = ss.getSheetByName('ledger');
+  var logSheet = ss.getSheetByName('log');
+
+  if (!availabilitySheet || !scheduleSheet || !ledgerSheet) {
+    Logger.log('Required sheets not found');
+    return;
+  }
+
+  var parsed = parseAvailability(availabilitySheet);
+  var availability = parsed.availability;
+  var partners = parsed.partners;
+  var baseLedger = loadLedger(ledgerSheet);
+
+  // Working copy used only for selection fairness within this run
+  var workingLedger = {};
+  Object.keys(baseLedger).forEach(function(name) { workingLedger[name] = baseLedger[name]; });
+
+  var data = scheduleSheet.getDataRange().getValues();
+  var updates = [];
+
   for (var i = 1; i < data.length; i++) {
-    var name = (data[i][0] || "").trim();
-    if (!name) continue;
-    people.push(name);
-    
-    if ((data[i][1] || "").toLowerCase() == 'yes') availability["Tuesday"].push(name);
-    if ((data[i][2] || "").toLowerCase() == 'yes') availability["Thursday"].push(name);
-    if ((data[i][3] || "").toLowerCase() == 'yes') availability["Friday"].push(name);
-    
-    if (data[i][4]) {
-      partners[name] = data[i][4].split(',').map(p => p.trim());
+    var row = data[i];
+    var dateValue = row[1];
+    var dayName = (row[2] || '').toString().trim();
+    if (!dateValue || !dayName) continue;
+
+    var who1 = (row[3] || '').toString().trim();
+    var who2 = (row[4] || '').toString().trim();
+    if (who1 && who2) continue;
+
+    var existing = who1 || who2 || '';
+    var candidates = getEligibleCandidatesForRow(dayName, availability, [who1, who2], workingLedger);
+    if (candidates.length === 0) continue;
+
+    if (!who1 && !who2) {
+      var pair = selectPairFromCandidates(candidates, partners, workingLedger);
+      if (pair[0]) scheduleSheet.getRange(i + 1, 4).setValue(pair[0]);
+      if (pair[1]) scheduleSheet.getRange(i + 1, 5).setValue(pair[1]);
+      updates.push({ row: i + 1, who: pair.slice(0, 2) });
+    } else {
+      // Only one blank; fill only that cell
+      var second = selectSecondWithPreference(existing, candidates, partners, workingLedger);
+      if (!second) continue;
+      if (!who1) scheduleSheet.getRange(i + 1, 4).setValue(second);
+      if (!who2) scheduleSheet.getRange(i + 1, 5).setValue(second);
+      updates.push({ row: i + 1, who: [existing, second].filter(function(x){return x;}) });
     }
   }
-  return { availability, people, partners };
-}
 
-
-
-/**
- * === Ledger Helpers ===
- */
-
-// Load ledger as { name: count }
-function loadLedger(sheet) {
-  var data = sheet.getDataRange().getValues();
-  var ledger = {};
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0]) ledger[data[i][0]] = data[i][1];
+  // Sheet-level timestamp only
+  var timestamp = Utilities.formatDate(new Date(), 'America/Denver', 'yyyy-MM-dd HH:mm');
+  scheduleSheet.getRange('F1').setValue(timestamp);
+  if (logSheet) {
+    logSheet.appendRow([timestamp, 'Filled Missing Assignments', JSON.stringify(updates)]);
   }
-  return ledger;
 }
+
 
 /**
  * Extend the schedule by adding Tuesdays, Thursdays, and Fridays for one month forward
@@ -119,6 +154,50 @@ function mainExtendScheduleOneMonth() {
   Logger.log('Added ' + newEntries.length + ' new schedule entries');
 }
 
+
+/**
+ * Parse availability into structures we can use
+ */
+function parseAvailability(sheet) {
+  var data = sheet.getDataRange().getValues();
+  var availability = { "Tuesday": [], "Thursday": [], "Friday": [] };
+  var people = [];
+  var partners = {};
+  
+  for (var i = 1; i < data.length; i++) {
+    var name = (data[i][0] || "").trim();
+    if (!name) continue;
+    people.push(name);
+    
+    if ((data[i][1] || "").toLowerCase() == 'yes') availability["Tuesday"].push(name);
+    if ((data[i][2] || "").toLowerCase() == 'yes') availability["Thursday"].push(name);
+    if ((data[i][3] || "").toLowerCase() == 'yes') availability["Friday"].push(name);
+    
+    if (data[i][4]) {
+      partners[name] = data[i][4].split(',').map(p => p.trim());
+    }
+  }
+  return { availability, people, partners };
+}
+
+
+
+/**
+ * === Ledger Helpers ===
+ */
+
+// Load ledger as { name: count }
+function loadLedger(sheet) {
+  var data = sheet.getDataRange().getValues();
+  var ledger = {};
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0]) ledger[data[i][0]] = data[i][1];
+  }
+  return ledger;
+}
+
+
+
 /**
  * Parse various date formats that might be in the spreadsheet
  */
@@ -190,73 +269,6 @@ function generateNextMonthDates(lastDate) {
   return entries;
 }
 
-/**
- * Fill any rows in the final schedule that have dates but are missing
- * one or both names in columns D and E. Uses availability and a working
- * copy of the ledger for fairness (do not write to the ledger sheet).
- * Partner preference is a soft constraint and is only applied when it
- * does not violate the fairness guard (avoid differences > 1 from min).
- */
-function mainFillMissingAssignments() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var availabilitySheet = ss.getSheetByName('availability');
-  var scheduleSheet = ss.getSheetByName('final schedule');
-  var ledgerSheet = ss.getSheetByName('ledger');
-  var logSheet = ss.getSheetByName('log');
-
-  if (!availabilitySheet || !scheduleSheet || !ledgerSheet) {
-    Logger.log('Required sheets not found');
-    return;
-  }
-
-  var parsed = parseAvailability(availabilitySheet);
-  var availability = parsed.availability;
-  var partners = parsed.partners;
-  var baseLedger = loadLedger(ledgerSheet);
-
-  // Working copy used only for selection fairness within this run
-  var workingLedger = {};
-  Object.keys(baseLedger).forEach(function(name) { workingLedger[name] = baseLedger[name]; });
-
-  var data = scheduleSheet.getDataRange().getValues();
-  var updates = [];
-
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    var dateValue = row[1];
-    var dayName = (row[2] || '').toString().trim();
-    if (!dateValue || !dayName) continue;
-
-    var who1 = (row[3] || '').toString().trim();
-    var who2 = (row[4] || '').toString().trim();
-    if (who1 && who2) continue;
-
-    var existing = who1 || who2 || '';
-    var candidates = getEligibleCandidatesForRow(dayName, availability, [who1, who2], workingLedger);
-    if (candidates.length === 0) continue;
-
-    if (!who1 && !who2) {
-      var pair = selectPairFromCandidates(candidates, partners, workingLedger);
-      if (pair[0]) scheduleSheet.getRange(i + 1, 4).setValue(pair[0]);
-      if (pair[1]) scheduleSheet.getRange(i + 1, 5).setValue(pair[1]);
-      updates.push({ row: i + 1, who: pair.slice(0, 2) });
-    } else {
-      // Only one blank; fill only that cell
-      var second = selectSecondWithPreference(existing, candidates, partners, workingLedger);
-      if (!second) continue;
-      if (!who1) scheduleSheet.getRange(i + 1, 4).setValue(second);
-      if (!who2) scheduleSheet.getRange(i + 1, 5).setValue(second);
-      updates.push({ row: i + 1, who: [existing, second].filter(function(x){return x;}) });
-    }
-  }
-
-  // Sheet-level timestamp only
-  var timestamp = Utilities.formatDate(new Date(), 'America/Denver', 'yyyy-MM-dd HH:mm');
-  scheduleSheet.getRange('F1').setValue(timestamp);
-  if (logSheet) {
-    logSheet.appendRow([timestamp, 'Filled Missing Assignments', JSON.stringify(updates)]);
-  }
-}
 
 // === Helpers used by fillMissingAssignments ===
 function getEligibleCandidatesForRow(dayName, availability, excludeNames, workingLedger) {
@@ -305,8 +317,3 @@ function incrementWorking(workingLedger, name) {
   workingLedger[name] = (workingLedger[name] || 0) + 1;
 }
 
-// Single entry point for triggers or manual runs
-function mainSchedule() {
-  mainExtendScheduleOneMonth();
-  mainFillMissingAssignments();
-}
